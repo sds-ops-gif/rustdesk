@@ -136,6 +136,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
           .showLoading(translate('Connecting...'), onCancel: closeConnection);
     });
     WakelockManager.enable(_uniqueKey);
+    if (!isIOS) {
+      _textController.addListener(_onNonIOSTextValueChanged);
+    }
     _physicalFocusNode.requestFocus();
     HardwareKeyboard.instance.addHandler(_handleLocalKeyEvent);
     gFFI.inputModel.listenToMouse(true);
@@ -187,6 +190,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   @override
   Future<void> dispose() async {
     HardwareKeyboard.instance.removeHandler(_handleLocalKeyEvent);
+    _textController.removeListener(_onNonIOSTextValueChanged);
     WidgetsBinding.instance.removeObserver(this);
     // Close the session up-front. `gFFI.close()` below only calls `sessionClose`
     // after several awaits (canvas save, image update, the `enable_soft_keyboard`
@@ -370,6 +374,44 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     }
   }
 
+  // Android (and other non-iOS) soft keyboard.
+  //
+  // Listens to the whole TextEditingValue (text + composing range) instead of
+  // `onChanged`, because an IME may commit its composition without changing
+  // the text, and `onChanged` is not called in that case.
+  //
+  // CJK IMEs (Japanese, Chinese, Korean...) keep an uncommitted "composing"
+  // region and rewrite it freely while the user converts (e.g. "かんじ" ->
+  // "漢字", or "か" -> "蚊" with the same length). The old length-only diff
+  // sent the raw kana immediately and then only a length delta on conversion,
+  // which duplicated or dropped characters on the remote side.
+  //
+  // Now:
+  // 1. While a composing region contains non-ASCII text, nothing is sent; the
+  //    remote side only receives the final committed text.
+  // 2. Otherwise the new text is diffed against what was already sent using
+  //    the common prefix: removed characters are sent as backspaces and the
+  //    rest is sent as text. This also handles autocorrect and insertions
+  //    before a closing bracket correctly.
+  void _onNonIOSTextValueChanged() {
+    if (!inputModel.keyboardInputAllowed) {
+      return;
+    }
+    final value = _textController.value;
+    final newValue = value.text;
+    if (value.isComposingRangeValid && !value.composing.isCollapsed) {
+      final composingText = value.composing.textInside(newValue);
+      if (composingText.codeUnits.any((c) => c > 0x7f)) {
+        // Still converting in the IME: wait for the commit.
+        return;
+      }
+    }
+    if (newValue == _value) {
+      return;
+    }
+    _handleNonIOSSoftKeyboardInput(newValue);
+  }
+
   void _handleNonIOSSoftKeyboardInput(String newValue) {
     var oldValue = _value;
     _value = newValue;
@@ -380,40 +422,55 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       // clipboard
       oldValue = '';
     }
-    // This length-only diff assumes the IME appends at the end. If an IME
-    // leaves the caret inside paired punctuation, later insertions can replay
-    // the closing symbol: "()" -> "(a)" sends ")" instead of "a". This is a
-    // client text-diff issue, independent of the host keyboard layout.
-    if (newValue.length == oldValue.length) {
-      // ?
-    } else if (newValue.length < oldValue.length) {
-      final char = 'VK_BACK';
-      inputModel.inputKey(char);
-    } else {
-      final content = newValue.substring(oldValue.length);
-      if (content.length > 1) {
-        if (oldValue != '' &&
-            content.length == 2 &&
-            (content == '""' ||
-                content == '()' ||
-                content == '[]' ||
-                content == '<>' ||
-                content == "{}" ||
-                content == '”“' ||
-                content == '《》' ||
-                content == '（）' ||
-                content == '【】')) {
-          // can not only input content[0], because when input ], [ are also auo insert, which cause ] never be input
-          bind.sessionInputString(sessionId: sessionId, value: content);
-          _openKeyboardUnlocked();
-          return;
-        }
-        bind.sessionInputString(sessionId: sessionId, value: content);
-      } else {
-        inputChar(content);
+
+    // Common prefix of the old and new value.
+    var common = 0;
+    while (common < oldValue.length &&
+        common < newValue.length &&
+        oldValue.codeUnitAt(common) == newValue.codeUnitAt(common)) {
+      common++;
+    }
+    // Do not split a UTF-16 surrogate pair (emoji etc.).
+    if (common > 0 && _isHighSurrogate(oldValue.codeUnitAt(common - 1))) {
+      common--;
+    }
+
+    // Delete the removed part (one backspace per character, not code unit).
+    final removed = oldValue.substring(common).runes.length;
+    for (var i = 0; i < removed; i++) {
+      inputModel.inputKey('VK_BACK');
+    }
+
+    final content = newValue.substring(common);
+    if (content.isEmpty) {
+      return;
+    }
+    if (content.runes.length > 1) {
+      bind.sessionInputString(sessionId: sessionId, value: content);
+      if (removed == 0 &&
+          oldValue != '' &&
+          content.length == 2 &&
+          (content == '""' ||
+              content == '()' ||
+              content == '[]' ||
+              content == '<>' ||
+              content == "{}" ||
+              content == '”“' ||
+              content == '「」' ||
+              content == '『』' ||
+              content == '《》' ||
+              content == '（）' ||
+              content == '【】')) {
+        // Reset the edit after auto-inserted paired punctuation, so the
+        // caret is at the end again.
+        _openKeyboardUnlocked();
       }
+    } else {
+      inputChar(content);
     }
   }
+
+  static bool _isHighSurrogate(int c) => c >= 0xD800 && c <= 0xDBFF;
 
   // handle mobile virtual keyboard
   void handleSoftKeyboardInput(String newValue) {
@@ -422,9 +479,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     }
     if (isIOS) {
       _handleIOSSoftKeyboardInput(newValue);
-    } else {
-      _handleNonIOSSoftKeyboardInput(newValue);
     }
+    // Non-iOS input is handled by `_onNonIOSTextValueChanged`, which listens
+    // to the controller so that IME composition commits are not missed.
   }
 
   void inputChar(String char) {
